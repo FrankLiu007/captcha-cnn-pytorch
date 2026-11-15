@@ -28,6 +28,11 @@ import torch.nn as nn
 from captcha_gen import DEFAULT_CHARACTERS
 from dataset import make_dataloaders
 from model import CaptchaCNN, count_parameters
+from optimizers import (
+    OPTIMIZER_REGISTRY,
+    build_optimizer,
+    describe_optimizers,
+)
 
 # 项目根目录（本文件所在目录）
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -52,9 +57,46 @@ def parse_args():
     parser.add_argument(
         "--val-batches", type=int, default=40, help="每轮验证用多少个 batch"
     )
-    parser.add_argument("--lr", type=float, default=1e-3, help="第一阶段学习率")
+    parser.add_argument("--lr", type=float, default=None, help="学习率；不填则用所选优化器的推荐值")
     parser.add_argument(
         "--lr-min", type=float, default=1e-4, help="第二阶段（精修）学习率"
+    )
+    parser.add_argument(
+        "--optimizer",
+        default="adam",
+        choices=list(OPTIMIZER_REGISTRY),
+        help="优化器。lamb / lion / radam 都自带自动学习率机制",
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=None,
+        help="权重衰减；不填则用所选优化器的推荐值",
+    )
+    parser.add_argument(
+        "--scheduler",
+        default="plateau",
+        choices=["none", "plateau", "cosine"],
+        help="学习率调度器。plateau=验证损失停滞时自动减半，"
+        "cosine=余弦平滑降温，none=不用（完全手动）",
+    )
+    parser.add_argument(
+        "--scheduler-patience",
+        type=int,
+        default=3,
+        help="ReduceLROnPlateau：验证损失多少轮没改善就减半",
+    )
+    parser.add_argument(
+        "--scheduler-factor",
+        type=float,
+        default=0.5,
+        help="ReduceLROnPlateau：学习率每次乘以多少",
+    )
+    parser.add_argument(
+        "--scheduler-min-lr",
+        type=float,
+        default=1e-6,
+        help="ReduceLROnPlateau：学习率下限",
     )
     parser.add_argument(
         "--refine-epochs",
@@ -71,8 +113,8 @@ def parse_args():
     parser.add_argument(
         "--num-workers",
         type=int,
-        default=0,
-        help="数据生成用的子进程数。Windows 建议 0，Linux/macOS 可设 4~8",
+        default=4,
+        help="数据生成用的子进程数。Windows 建议 4 以下，Linux/macOS 可设 8",
     )
     parser.add_argument("--seed", type=int, default=1, help="随机种子")
     parser.add_argument("--n-len", type=int, default=4, help="验证码长度")
@@ -156,10 +198,12 @@ def compute_loss(outputs, labels, criterion):
     return loss
 
 
-def run_epoch(model, loader, device, criterion, optimizer=None):
+def run_epoch(model, loader, device, criterion, optimizer=None, scheduler=None):
     """跑一轮训练或验证。
 
     optimizer 为 None 时只做验证（不更新参数）。
+    scheduler 为 None 时表示这轮不调度学习率；
+    否则每个 batch 训练完就调用一次 scheduler.step()（step 级调度）。
 
     返回 (平均损失, 整体准确率, 每位字符准确率列表)。
       - 整体准确率：4 位全对才算这张验证码答对
@@ -188,6 +232,9 @@ def run_epoch(model, loader, device, criterion, optimizer=None):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            # step 级调度器（比如 CosineAnnealingLR）在每个 batch 后走一步
+            if scheduler is not None:
+                scheduler.step()
 
         batch_size = images.size(0)
         total_loss += loss.item() * batch_size
@@ -248,15 +295,17 @@ def plot_history(path, out_path):
 
     setup_chinese_font()
 
-    epochs, train_losses, val_losses, accs = [], [], [], []
+    epochs, train_losses, val_losses, accs, lrs = [], [], [], [], []
     with open(path, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             epochs.append(int(row["epoch"]))
             train_losses.append(float(row["train_loss"]))
             val_losses.append(float(row["val_loss"]))
             accs.append(float(row["overall_acc"]) * 100)
+            # lr 列可能不存在（老日志），做个兜底
+            lrs.append(float(row.get("lr") or 0))
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    fig, axes = plt.subplots(1, 3, figsize=(17, 4.5))
 
     axes[0].plot(epochs, train_losses, label="train loss", color="#1f4e79")
     axes[0].plot(epochs, val_losses, label="val loss", color="#c0392b")
@@ -272,6 +321,18 @@ def plot_history(path, out_path):
     axes[1].set_title("验证集整体准确率（4 位全对）")
     axes[1].grid(True, alpha=0.3)
     axes[1].legend()
+
+    # 学习率曲线：自动学习率和手动学习率的差别一眼就能看出来
+    if any(lr > 0 for lr in lrs):
+        axes[2].plot(epochs, lrs, label="学习率", color="#8e44ad")
+        axes[2].set_xlabel("Epoch")
+        axes[2].set_ylabel("Learning Rate")
+        axes[2].set_title("学习率变化")
+        axes[2].set_yscale("log")
+        axes[2].grid(True, alpha=0.3)
+        axes[2].legend()
+    else:
+        axes[2].axis("off")
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -297,6 +358,58 @@ def save_checkpoint(model, path, **extra):
 # ----------------------------------------------------------------------
 # 主流程
 # ----------------------------------------------------------------------
+def build_scheduler(scheduler_name, optimizer, args, total_steps):
+    """按名字创建学习率调度器。
+
+    返回 (scheduler, mode)：
+      - mode == "step"  → 每训练完一个 batch 调用 scheduler.step()
+      - mode == "epoch" → 每训练完一轮调用 scheduler.step(metric)
+      - mode == None    → 没有调度器
+
+    三种模式的区别很重要：
+
+      plateau（ReduceLROnPlateau）：
+        靠「验证指标」驱动，属于 epoch 级调度。
+        验证损失连续若干轮不改善就把 lr 乘以 factor（默认 0.5）。
+        这是最稳的自动学习率，对本项目这种「数据无限生成、
+        验证集一直有噪声」的场景特别合适。
+
+      cosine（CosineAnnealingLR）：
+        靠「步数」驱动，属于 step 级调度（每 batch 调一次）。
+        学习率沿着余弦曲线从最大学到最小值，平滑且可预期，
+        可以完全替代原来的「两阶段手动降 lr」。
+
+      none：
+        完全手动，保持原来每轮硬赋值 lr 的行为。
+    """
+    if scheduler_name == "none":
+        return None, None
+
+    if scheduler_name == "plateau":
+        return (
+            torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="min",
+                factor=args.scheduler_factor,
+                patience=args.scheduler_patience,
+                min_lr=args.scheduler_min_lr,
+            ),
+            "epoch",
+        )
+
+    if scheduler_name == "cosine":
+        return (
+            torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=total_steps,
+                eta_min=args.scheduler_min_lr,
+            ),
+            "step",
+        )
+
+    raise ValueError(f"未知的调度器 {scheduler_name!r}")
+
+
 def train_stage(
     model,
     train_loader,
@@ -310,11 +423,16 @@ def train_stage(
     checkpoint_path,
     log_path,
     tag="",
+    scheduler=None,
+    scheduler_mode=None,
+    auto_lr=False,
 ):
     """跑一个训练阶段。
 
     阶段之间可以换学习率（比如从 1e-3 降到 1e-4）。
     tag 只是打印时用来区分阶段的名字。
+
+    auto_lr 为 True 时，不再每轮硬赋值 lr，而是交给 scheduler 自动调整。
     """
     best_acc = -1.0
     patience = 8  # 验证集准确率连续多少轮没提升就提前结束这一阶段
@@ -322,18 +440,36 @@ def train_stage(
 
     for epoch in range(start_epoch, start_epoch + epochs):
         started = time.time()
-        # 每个阶段开始时调整学习率
-        for group in optimizer.param_groups:
-            group["lr"] = lr
+        # auto_lr=False 时才是手动设置学习率；
+        # auto_lr=True 时由 scheduler 自己控制，这里不碰。
+        if not auto_lr:
+            for group in optimizer.param_groups:
+                group["lr"] = lr
+
+        # 当前学习率（scheduler 模式下会在 step 之后变化，所以先记录）
+        cur_lr = optimizer.param_groups[0]["lr"]
 
         train_loss, _, _ = run_epoch(
-            model, train_loader, device, criterion, optimizer=optimizer
+            model,
+            train_loader,
+            device,
+            criterion,
+            optimizer=optimizer,
+            scheduler=scheduler if scheduler_mode == "step" else None,
         )
         val_loss, val_acc, per_pos = run_epoch(
             model, val_loader, device, criterion, optimizer=None
         )
 
-        write_log(log_path, epoch + 1, train_loss, val_loss, val_acc, per_pos, lr)
+        # epoch 级调度器：拿验证损失来驱动
+        if scheduler is not None and scheduler_mode == "epoch":
+            before = optimizer.param_groups[0]["lr"]
+            scheduler.step(val_loss)
+            after = optimizer.param_groups[0]["lr"]
+            if after != before:
+                print(f"    ↘ 自动调整学习率 {before:.2e} → {after:.2e}")
+
+        write_log(log_path, epoch + 1, train_loss, val_loss, val_acc, per_pos, cur_lr)
 
         improved = val_acc > best_acc
         if improved:
@@ -352,7 +488,7 @@ def train_stage(
         pos_str = " ".join(f"{a * 100:5.1f}%" for a in per_pos)
         marker = " *最佳*" if improved else ""
         print(
-            f"[{tag}] epoch {epoch + 1:3d} | lr {lr:.1e} | "
+            f"[{tag}] epoch {epoch + 1:3d} | lr {cur_lr:.1e} | "
             f"train {train_loss:.4f} | val {val_loss:.4f} | "
             f"整体 {val_acc * 100:6.2f}% | 每位 {pos_str} | "
             f"{time.time() - started:.1f}s{marker}"
@@ -409,59 +545,117 @@ def main():
     print("-" * 70)
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, amsgrad=True)
+
+    # 优化器：可以换成自带「自动学习率」机制的 LAMB / Lion / RAdam
+    overrides = {}
+    if args.weight_decay is not None:
+        overrides["weight_decay"] = args.weight_decay
+    optimizer, used_lr = build_optimizer(
+        args.optimizer, model.parameters(), lr=args.lr, **overrides
+    )
+    opt_spec = OPTIMIZER_REGISTRY[args.optimizer]
+    print(f"优化器：{opt_spec['label']}")
+    print(f"  学习率 {used_lr:g} | weight_decay "
+          f"{optimizer.param_groups[0].get('weight_decay', 0.0):g}")
+    print(f"  {opt_spec['desc']}")
+
+    # 学习率调度器：负责「学习率大小随训练进程自动变化」这一层
+    # total_steps 用来给余弦调度器算一个完整周期
+    # （自动模式下只有一段训练，所以总步数就是 epochs × steps_per_epoch）
+    if args.scheduler == "none":
+        total_steps = args.steps_per_epoch
+    else:
+        total_steps = args.epochs * args.steps_per_epoch
+    scheduler, scheduler_mode = build_scheduler(
+        args.scheduler, optimizer, args, total_steps
+    )
+    if scheduler is None:
+        print("学习率调度：手动（沿用原来的两阶段策略）")
+    elif scheduler_mode == "epoch":
+        print(
+            f"学习率调度：ReduceLROnPlateau（验证损失连续 "
+            f"{args.scheduler_patience} 轮不改善就 ×{args.scheduler_factor}）"
+        )
+    else:
+        print("学习率调度：CosineAnnealingLR（余弦平滑降温）")
 
     # 续训：先加载权重
     if args.resume and os.path.exists(args.resume):
         payload = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(payload["state_dict"])
         print(f"已从 {args.resume} 载入权重（epoch {payload.get('epoch', '?')}）")
-        print("-" * 70)
+    print("-" * 70)
 
-    # 第一阶段：大步长快速收敛
-    best_acc = train_stage(
-        model,
-        train_loader,
-        val_loader,
-        device,
-        criterion,
-        optimizer,
-        epochs=args.epochs,
-        lr=args.lr,
-        start_epoch=0,
-        checkpoint_path=args.checkpoint,
-        log_path=args.log,
-        tag="阶段1",
-    )
+    # scheduler 模式下，学习率完全交给 scheduler，不再手动设值，
+    # 因此也不再需要「阶段1 → 阶段2」这套手动降 lr 的流程。
+    auto_lr = scheduler is not None
 
-    # 第二阶段：小步长精修
-    if not args.no_refine and args.refine_epochs > 0:
-        print("-" * 70)
-        print(
-            f"进入第二阶段：学习率降到 {args.lr_min:g}，"
-            f"继续精修 {args.refine_epochs} 轮"
-        )
-        # 重新载入最佳权重再精修，避免被训练末期抖动的参数带偏
-        if os.path.exists(args.checkpoint):
-            payload = torch.load(
-                args.checkpoint, map_location=device, weights_only=False
-            )
-            model.load_state_dict(payload["state_dict"])
-        refine_best = train_stage(
+    if auto_lr:
+        # 自动模式：一个 scheduler 管到底，EarlyStopping 负责收尾。
+        # 此时 --epochs 就是总轮数，--refine-epochs 不再单独生效
+        # （因为第二阶段的「手动降 lr」已经没有意义了）。
+        best_acc = train_stage(
             model,
             train_loader,
             val_loader,
             device,
             criterion,
             optimizer,
-            epochs=args.refine_epochs,
-            lr=args.lr_min,
-            start_epoch=args.epochs,
+            epochs=args.epochs,
+            lr=used_lr,
+            start_epoch=0,
             checkpoint_path=args.checkpoint,
             log_path=args.log,
-            tag="阶段2",
+            tag="自动学习率",
+            scheduler=scheduler,
+            scheduler_mode=scheduler_mode,
+            auto_lr=True,
         )
-        best_acc = max(best_acc, refine_best)
+    else:
+        # 手动模式：保留原来的两阶段策略
+        best_acc = train_stage(
+            model,
+            train_loader,
+            val_loader,
+            device,
+            criterion,
+            optimizer,
+            epochs=args.epochs,
+            lr=used_lr,
+            start_epoch=0,
+            checkpoint_path=args.checkpoint,
+            log_path=args.log,
+            tag="阶段1",
+        )
+
+        # 第二阶段：小步长精修
+        if not args.no_refine and args.refine_epochs > 0:
+            print("-" * 70)
+            print(
+                f"进入第二阶段：学习率降到 {args.lr_min:g}，"
+                f"继续精修 {args.refine_epochs} 轮"
+            )
+            # 重新载入最佳权重再精修，避免被训练末期抖动的参数带偏
+            if os.path.exists(args.checkpoint):
+                payload = torch.load(
+                    args.checkpoint, map_location=device, weights_only=False
+                )
+                model.load_state_dict(payload["state_dict"])
+            refine_best = train_stage(
+                model,
+                train_loader,
+                val_loader,
+                device,
+                criterion,
+                optimizer,
+                epochs=args.refine_epochs,
+                lr=args.lr_min,
+                start_epoch=args.epochs,
+                checkpoint_path=args.checkpoint,
+                log_path=args.log,
+                tag="阶段2",
+            )
+            best_acc = max(best_acc, refine_best)
 
     # 训练结束：载入最佳权重做最终评估
     if os.path.exists(args.checkpoint):

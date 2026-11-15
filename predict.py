@@ -148,8 +148,14 @@ def main():
     generator = CaptchaGenerator(characters=DEFAULT_CHARACTERS, n_len=model.n_len)
 
     if args.text:
-        texts = [args.text[: model.n_len].ljust(model.n_len, "0")]
-        images, _ = generator.generate_batch(1)
+        # 指定文本时，要生成「就是这段文字」的验证码。
+        # 不能用 generate_batch()——它生成的是随机文本的验证码，
+        # 那样拿到的图和标签对不上，评估结果毫无意义。
+        text = args.text[: model.n_len].ljust(model.n_len, "0")
+        image, text = generator.generate(text)
+        images = np.asarray(image, dtype=np.float32) / 255.0
+        images = images.transpose(2, 0, 1)[None, ...]  # 加上 batch 维
+        texts = [text]
     else:
         images, texts = generator.generate_batch(args.num)
 

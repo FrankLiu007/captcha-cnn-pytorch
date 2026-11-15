@@ -81,16 +81,20 @@ class CaptchaCNN(nn.Module):
 
         # 输入 64x128，经过 5 次 2x2 池化后变成 2x4
         self.flat_features = height // 32 * width // 32 * in_channels
-        # 展平 -> 512 维的公共特征
-        self.fc = nn.Sequential(
-            nn.Linear(self.flat_features, 512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-        )
-        # 4 个独立的分类头：第 i 个头负责第 i 位字符
+        # 展平后直接接 4 个分类头。
+        # 参考项目（Keras 版）就是这样做的：Flatten 之后直接接 4 个 Dense，
+        # 中间不再加一层共享的全连接。
+        # 原因：Flatten 出来的 2048 维里还带着「哪一块区域对应哪一位」的信息，
+        # 如果中间压成 512 维，这部分空间信息就被抹掉了，
+        # 网络要重新学「第几位字符长什么样」，收敛会慢很多。
+        # 4 个头各自从 2048 维里各取所需，互不干扰。
         self.classifiers = nn.ModuleList(
-            [nn.Linear(512, n_class) for _ in range(n_len)]
+            [nn.Linear(self.flat_features, n_class) for _ in range(n_len)]
         )
+
+        # 一个轻量的 dropout 放在展平之后，防止过拟合。
+        # 放在分类头之前（而不是每个头里），保持 4 个头看到相同的输入。
+        self.dropout = nn.Dropout(dropout)
 
         self._init_weights()
 
@@ -123,7 +127,7 @@ class CaptchaCNN(nn.Module):
         """
         x = self.features(x)          # (B, 256, 2, 4)
         x = x.flatten(1)               # (B, 2048)
-        x = self.fc(x)                 # (B, 512)
+        x = self.dropout(x)            # (B, 2048)
         return [head(x) for head in self.classifiers]
 
 
