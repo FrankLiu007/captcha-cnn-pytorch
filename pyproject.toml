@@ -1,16 +1,27 @@
 [project]
 name = "pytorch-captcha-cnn"
 version = "0.1.0"
-description = "用 PyTorch + CNN 从零实现验证码识别（CTC + 多头分类）"
+description = "用 PyTorch + CNN + CTC 从零实现验证码识别"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "matplotlib>=3.11.2",
-    "numpy>=2.4.6",
-    "pillow>=13.0.0",
-    "torch>=2.15.0",
-    "torchvision>=0.29.2",
+    "matplotlib>=3.9",
+    "numpy>=1.26",
+    "pillow>=10.0",
+    "torch>=2.11",
+    "torchvision>=0.26",
 ]
+
+[[tool.uv.index]]
+# 指定 PyTorch 官方 CUDA 12.8 源。
+# 这样 `uv sync` 会安装带 CUDA 支持的版本，而不是 PyPI 上的 CPU 版。
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
 
 [build-system]
 requires = ["hatchling"]

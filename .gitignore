@@ -24,6 +24,7 @@ logs/
 # 生成的样本与图片
 samples/
 figures/
+figures_smoke/
 !figures/.gitkeep
 
 # 日志与临时文件
