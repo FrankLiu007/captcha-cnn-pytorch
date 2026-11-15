@@ -108,7 +108,7 @@ class CaptchaGenerator:
         font_paths: 字体文件路径列表，依次尝试；None 表示自动查找
         font_size: 字号，None 表示按图像高度自动推算
         """
-        self.characters = characters
+        self.characters = characters if characters else DEFAULT_CHARACTERS
         self.width = width
         self.height = height
         self.n_len = n_len
