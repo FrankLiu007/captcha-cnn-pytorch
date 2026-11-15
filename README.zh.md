@@ -11,6 +11,7 @@
 > 2. 理解「多输出」和「多分类」的区别，以及为什么要有 4 个分类头
 > 3. 理解「整体准确率」和「单字符准确率」为什么不一样
 > 4. 亲手跑一遍训练，观察 loss 下降和准确率上升的过程
+> 5. 搞清「自动学习率」的两层机制，以及 LAMB / Lion / RAdam 为什么不用 warmup
 
 ---
 
@@ -68,6 +69,7 @@ pytorch-captcha-cnn/
 ├── captcha_gen.py      # 验证码生成器（纯 Pillow + numpy，不依赖 torch）
 ├── dataset.py          # 把生成器包装成 PyTorch Dataset / DataLoader
 ├── model.py            # CNN 模型
+├── optimizers.py       # LAMB / Lion / RAdam 等自适应优化器
 ├── train.py            # 训练脚本
 ├── predict.py          # 识别并画对比图
 ├── evaluate.py         # 算整体准确率和每一位的准确率
@@ -214,10 +216,51 @@ def compute_loss(outputs, labels, criterion):
 `labels` 形状是 `(B, 4)`，第 i 列是第 i 位字符的标签；
 `labels[:, i]` 取出来正好对应第 i 个分类头。
 
+#### 可选：自动学习率
+
+训练脚本还支持把学习率交给优化器/调度器自动调整（详见第 8 节）。
+
+```bash
+python train.py --optimizer lamb --scheduler plateau
+```
+
+`--scheduler plateau/cosine` 时，学习率完全交给调度器，
+`--refine-epochs` 和 `--lr-min` 不再生效（已经没有「手动降 lr 的第二阶段」了）。
+
 ### 3.5 `predict.py` / `evaluate.py`
 
 - `predict.py`：生成若干张验证码并识别，画出对比图（对的绿标题、错的红标题）
 - `evaluate.py`：统计整体准确率和每一位的准确率
+
+### 3.6 `optimizers.py` — 自适应优化器
+
+纯 PyTorch 实现的自适应优化器，不依赖任何第三方库，可以逐行讲解。
+
+```python
+from optimizers import build_optimizer
+
+optimizer, lr = build_optimizer("lamb", model.parameters())
+```
+
+每个优化器的核心思想：
+
+| 名字 | 核心机制 | 一句话解释 |
+|---|---|---|
+| `adam` | 二阶动量自适应 | 用梯度平方的滑动平均给每个参数算步长 |
+| `adamw` | Adam + 解耦 weight decay | 权重衰减不再和梯度耦合 |
+| `radam` | 可纠正项 ρ_t | 早期自动退化成 SGD-Momentum，不用 warmup |
+| `lion` | `sign(动量)` | 更新方向只取符号，天然稳，不用 warmup |
+| `lamb` | 逐层信任比 `‖w‖/‖u‖` | 每层自动缩放步长，基本不用调 lr |
+
+**LAMB 的信任比**是这一节最值得讲的内容：
+
+```python
+trust = ||w|| / ||u||        # u 是 Adam 算出来的更新量
+w -= lr * trust * u
+```
+
+直觉：权重范数大的层，同样的更新量相对太小，信任比会自动把步长调小；
+权重范数小的层则相反，步长自动放大。这就是「逐层自适应」的含义。
 
 ---
 
@@ -362,7 +405,105 @@ python train.py --epochs 2 --steps-per-epoch 20 --no-refine
 
 ---
 
-## 8. 参考
+## 8. 自动学习率优化器（进阶）
+
+### 8.1 「自动学习率」其实是两层机制
+
+这是很多人搞混的地方，值得单独讲清楚：
+
+| 层级 | 谁负责 | 作用 | 本项目对应 |
+|---|---|---|---|
+| **逐参数 / 逐层自动缩放** | 优化器本身 | 每个参数层自己算步长 | `optimizers.py` 里的 LAMB / Lion / RAdam |
+| **学习率大小随进程变化** | `lr_scheduler` | 决定 lr 的量级随训练进程怎么变 | `--scheduler plateau/cosine` |
+
+`Adam` 其实已经有第一层了（基于二阶动量），但它对所有参数用同一套缩放，
+**没有逐层自适应**——这正是 LAMB 要补的。
+
+### 8.2 各优化器的机制
+
+| 名字 | 机制 | 推荐 lr | 特点 |
+|---|---|---|---|
+| `adam` | 二阶动量自适应 | `1e-3` | 基线 |
+| `adamw` | Adam + 解耦 weight decay | `1e-3` | 默认首选，比 Adam 稳 |
+| `radam` | 可纠正项 ρ_t | `1e-3` | 早期自动退化成 SGD-Momentum，**不用 warmup** |
+| `lion` | `sign(动量)` | `2e-4` | 显存省一半，**不用 warmup** |
+| `lamb` | 逐层信任比 `‖w‖/‖u‖` | `1e-3` | **基本不用调 lr** |
+
+### 8.3 为什么 RAdam / Lion 不需要 warmup
+
+**warmup** 是干什么的：训练最初几步，Adam 的二阶动量统计量还不准，
+按它算出来的自适应步长会过大，导致 loss 一下炸掉。所以先用小学习率热几分钟。
+
+- **RAdam** 的做法：算一个「可纠正项」ρ_t 判断当前二阶矩可不可信。
+  不可信就自动退化成 SGD-Momentum（自带 bias correction），
+  信任了就切回完整的自适应。所以**不用手工 warmup**。
+
+  ```python
+  rho_t = rho_inf - 2 * t * (beta2 - 1) / bias_correction2
+  if rho_t > 4:
+      # 二阶矩不可信 → 退化成 SGD-Momentum
+      param.add_(m_hat / denom, alpha=-lr)
+  else:
+      # 二阶矩可信 → 完整 Adam
+      param.add_(m_hat / v_hat_sqrt, alpha=-lr)
+  ```
+
+- **Lion** 的做法：更新方向取动量的**符号**（`sign`），单步幅度天然被限制在 ±1，
+  所以就算一开始梯度方向乱也不会炸。它的更新只有一阶动量，
+  显存占用是 Adam 的一半。
+
+### 8.4 LAMB 的逐层信任比
+
+LAMB = Adam 的动量 + LARS 的逐层缩放：
+
+```python
+update = m_hat / (sqrt(v_hat) + eps)    # 和 Adam 一样的自适应更新量
+trust  = ||w|| / ||update||               # 逐层信任比
+w     -= lr * trust * update
+```
+
+直觉：
+- 某层权重很大（后面的层通常范数更大），同样的更新量相对太小，
+  信任比会自动把步长**调小**，避免大权重层被推得太狠；
+- 某层权重很小，信任比大，步长自动**放大**，训练更快。
+
+这就是 BERT 训练的标准配置，也是本项目里最接近「不用调 lr」的方案。
+
+### 8.5 怎么用
+
+```bash
+# 最省心：LAMB 的逐层自适应 + plateau 兜底
+python train.py --optimizer lamb --scheduler plateau
+
+# 想看学习率曲线怎么走：余弦平滑
+python train.py --optimizer adamw --scheduler cosine
+
+# 对照组：回到原来的手动两阶段
+python train.py --optimizer adam --scheduler none
+```
+
+**`--scheduler plateau`**（`ReduceLROnPlateau`）靠验证损失驱动：
+连续 `--scheduler-patience` 轮（默认 3）验证损失不改善，就把 lr 乘以
+`--scheduler-factor`（默认 0.5）。
+
+> 本项目的数据是「无限生成」的，验证集每一轮都是新样本、永远带噪声，
+> 所以这种「看指标才调」的策略比按步数硬降更合适。
+
+**`--scheduler cosine`**（`CosineAnnealingLR`）按步数平滑降温：
+学习率沿着余弦曲线从最大走到最小，每个 batch 调一次。
+
+训练曲线图会多画一条**学习率变化**子图（对数坐标），
+一眼就能看出手动两阶段和自动调参的差别。
+
+### 8.6 一个重要的提醒
+
+这些优化器的「自动」是**按层 / 按参数自动缩放**，
+**不是凭空决定学习率大小**。所以基础 `lr` 还是要给一个，
+只是宽容度大得多——`--lr` 不填时会自动用所选优化器的推荐值。
+
+---
+
+## 9. 参考
 
 - [ypwhs/captcha_break](https://github.com/ypwhs/captcha_break) — 原始 Keras 实现，本项目的思路来源
 - PyTorch 官方文档：<https://pytorch.org/docs/stable/index.html>
