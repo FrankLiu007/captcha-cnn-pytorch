@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# uv
+.uv/
+
+# 训练产物
+checkpoints/
+runs/
+logs/
+*.ckpt
+*.pt
+*.pth
+
+# 生成的样本与图片
+samples/
+figures/
+!figures/.gitkeep
+
+# 日志与临时文件
+*.log
+.DS_Store
+.vscode/
+.idea/
