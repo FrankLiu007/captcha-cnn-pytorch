@@ -232,30 +232,132 @@ class CaptchaGenerator:
           - 随机前景色（深色，和浅背景对比明显）
           - 随机旋转 ±20 度
           - 随机上下错位
+
+        字号是**按格子宽度自适应算出来的**：每个字符分到 width/n 像素宽的
+        一格，字号必须小于这格，否则字符会溢出格子、被画布边缘裁掉半边。
+
+        排布方式：
+          1. 先按自适应字号把所有字符都渲染出来（还没旋转）
+          2. 量出它们加起来的总宽度
+          3. 整串水平居中放到画布上，再依次摆
+
+        这样既保证了字符不越界（总宽一定放得下），
+        又不会像「按格子中心对齐」那样让字符偏到左边、右侧留一大片空白。
         """
-        font = self._get_font(self.font_size)
         n = len(text)
         # 每个字符占据的横向宽度
         slot = self.width / max(n, 1)
 
-        for i, ch in enumerate(text):
-            # 这块字符区域的中点
-            cx = int(slot * (i + 0.5))
-            cy = int(self.height / 2)
+        # 字号自适应：不能超过格子的宽度，否则旋转后会溢出格子。
+        # 旋转会让字符变宽（约 1.3 倍），所以这里留出余量。
+        font = self._fit_font(slot * 0.78, self.height * 0.8)
 
+        # 第一步：先把所有字符渲染出来（带旋转），量出总宽度
+        rendered = []
+        for ch in text:
             char_img = self._render_char(ch, font)
-            # 随机旋转
             angle = random.uniform(-20, 20)
             rotated = char_img.rotate(angle, expand=True, resample=Image.BILINEAR)
+            rendered.append(rotated)
 
-            # 纵向随机错位
+        total_w = sum(img.width for img in rendered)
+        total_h = max(img.height for img in rendered) if rendered else 0
+
+        # 字符之间的间隙：只算 n-1 个（字符与字符之间），
+        # 不能算 n 个，否则最后一个字符会被推出画布右边。
+        # 同时左右各留一点边距（margin），避免字符贴边被裁。
+        margin = 2
+        avail = max(1, self.width - margin * 2)
+
+        # 保险：如果总宽还是超了画布（比如碰巧全是宽字符 W/M/Q），
+        # 就把每个字符等比缩小，直到能放下。
+        # 这一步保证**任何字符组合都不会被裁**。
+        if total_w > avail:
+            scale = avail / total_w
+            resized = []
+            for img in rendered:
+                new_w = max(1, int(img.width * scale))
+                new_h = max(1, int(img.height * scale))
+                resized.append(img.resize((new_w, new_h), Image.LANCZOS))
+            rendered = resized
+            total_w = sum(img.width for img in rendered)
+            total_h = max(img.height for img in rendered) if rendered else 0
+
+        gap = max(0, (avail - total_w) // max(n - 1, 1))
+
+        # 摆完所有字符和间隙后的实际总宽，再水平居中
+        used_w = total_w + gap * (n - 1)
+        start_x = max(margin, (self.width - used_w) // 2)
+        # 纵向居中，留出随机错位的空间
+        base_y = max(0, (self.height - total_h) // 2)
+
+        # 依次摆上去
+        x = start_x
+        for i, rotated in enumerate(rendered):
+            # 随机纵向错位
             dy = random.randint(-self.height // 12, self.height // 12)
-            px = cx - rotated.width // 2
-            py = cy - rotated.height // 2 + dy
+            px = x
+            py = base_y + dy
+
+            # 纵向不许越界
+            py = max(0, min(py, self.height - rotated.height))
+            # 横向也不许越界（万一总宽算多了，硬拉回来）
+            px = max(0, min(px, self.width - rotated.width))
 
             # alpha_composite 会按 alpha 通道把字符图混合到画布上，
             # 透明的部分保留原来的背景。
             canvas.alpha_composite(rotated, dest=(px, py))
+            x += rotated.width
+            # 只有最后一个字符后面不加间隙
+            if i < n - 1:
+                x += gap
+
+    def _fit_font(self, max_width, max_height):
+        """找一个既不超过 max_width 也不超过 max_height 的字号。
+
+        从原始字号往下试，取第一个满足条件的。
+        这样字符就不会因为太大而溢出格子 / 被画布裁掉。
+
+        这里用**平均字符宽度**而不是最宽字符来定字号：
+        如果按最宽的 `W` 来卡，所有字符都会被压到最小尺寸，
+        结果就是「一个字符占 1/4 画布，但字看起来很小」。
+        用平均值定字号，既能保证大多数字符放得下，
+        又能让字号保持足够大。
+        """
+        base_font = self._get_font(self.font_size)
+        widths = [self._char_width(ch, base_font) for ch in self.characters[:8]]
+        avg_width = sum(widths) / max(len(widths), 1)
+
+        size = self.font_size
+        while size > 8:
+            font = self._get_font(size)
+            # 平均宽度随字号线性缩放
+            w = avg_width * (size / self.font_size)
+            h = self._char_height(self.characters[0], font)
+            if w <= max_width and h <= max_height:
+                return font
+            size -= 1
+        return self._get_font(8)
+
+    def _char_width(self, ch, font):
+        """量一个字符在指定字体下的实际宽度（像素）。"""
+        tmp = Image.new("RGBA", (self.font_size * 3, self.font_size * 3), (0, 0, 0, 0))
+        tmp_draw = ImageDraw.Draw(tmp)
+        tmp_draw.text((10, 10), ch, font=font, fill=(0, 0, 0, 255))
+        bbox = tmp.getbbox()
+        if bbox is None:
+            return self.font_size
+        return bbox[2] - bbox[0]
+
+    def _char_height(self, ch, font):
+        """量一个字符在指定字体下的实际高度（像素）。"""
+        tmp = Image.new("RGBA", (self.font_size * 3, self.font_size * 3), (0, 0, 0, 0))
+        tmp_draw = ImageDraw.Draw(tmp)
+        tmp_draw.text((10, 10), ch, font=font, fill=(0, 0, 0, 255))
+        bbox = tmp.getbbox()
+        if bbox is None:
+            return self.font_size
+        return bbox[3] - bbox[1]
 
     def _render_char(self, ch, font):
         """把单个字符渲染到一张透明背景的小图上。

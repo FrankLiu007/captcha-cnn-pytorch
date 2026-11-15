@@ -1,13 +1,36 @@
-# pytorch-captcha-cnn
+# captcha-cnn-pytorch
 
-用 PyTorch + 卷积神经网络从零实现验证码识别，**CPU 和 GPU 都能跑**。
+<div align="center">
 
-数据是「现生成现用」的：每次取样本都现场画一张新的验证码，
-所以训练集理论上无限，也不存在过拟合到固定图片的问题。
+**用 PyTorch 从零实现的多输出 CNN 验证码识别器**
 
-参考项目：[ypwhs/captcha_break](https://github.com/ypwhs/captcha_break)（Keras 版多输出 CNN）。
-本项目把它的思路用 PyTorch 重写，并把验证码生成器也自己实现了一遍，
-方便课堂上逐行讲解。
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/pytorch-2.1%2B-ee4c2c.svg)](https://pytorch.org/)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
+</div>
+
+---
+
+## 效果
+
+<div align="center">
+<img src="docs/predictions.png" width="720" alt="识别结果">
+</div>
+
+验证集整体准确率 **100.00%**（3200 张全新样本，4 位全对）。
+
+<div align="center">
+<img src="docs/captcha_samples.png" width="640" alt="验证码样例">
+</div>
+
+## 这个项目做了什么
+
+- **验证码生成器从零手写** —— 纯 Pillow + numpy，不依赖第三方 `captcha` 库
+- **数据无限生成** —— 每次取样本现场画一张新图，不存在过拟合到固定图片的问题
+- **多输出 CNN** —— VGG 风格卷积主干 + 4 个独立分类头，每位字符单独判断
+- **自带自适应优化器** —— LAMB / Lion / RAdam 纯 PyTorch 实现，零额外依赖
+- **中文注释** —— 每个设计决策都写清了「为什么」，适合逐行讲解
 
 ## 快速开始
 
@@ -26,6 +49,9 @@ python predict.py --num 12
 # 4. 算一下准确率
 python evaluate.py --batches 20
 ```
+
+> 首次运行会先花几分钟训练（CPU 上约 55 秒/轮），之后 `predict.py` 直接用
+> `checkpoints/captcha_cnn_best.pt` 推理。
 
 ## 常用参数
 
@@ -90,17 +116,16 @@ python train.py --optimizer adamw --scheduler cosine
 训练曲线图会多画一条**学习率变化**子图（对数坐标），
 一眼就能看出手动两阶段和自动调参的差别。
 
-## 用 uv 管理环境（可选）
+## 用 uv 管理环境（推荐）
 
-项目自带 `pyproject.toml`，也可以用 [uv](https://docs.astral.sh/uv/) 管理虚拟环境：
+项目自带 `pyproject.toml`，用 [uv](https://docs.astral.sh/uv/) 管理虚拟环境：
 
 ```bash
 uv sync                 # 创建 .venv 并安装依赖
 uv run python train.py # 在虚拟环境里跑训练
 ```
 
-注意：uv 默认从 PyPI 装 PyTorch，那是 **CPU 版**。
-要用显卡的话，在 `pyproject.toml` 里加上 CUDA 索引：
+`pyproject.toml` 里已经配置了 PyTorch 官方的 **CUDA 12.8 索引源**：
 
 ```toml
 [[tool.uv.index]]
@@ -110,13 +135,19 @@ explicit = true
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
 ```
 
-或者更简单，直接往 `.venv` 里装 CUDA 版：
+所以 `uv sync` 会**自动装 CUDA 版**的 PyTorch（`torch 2.11.0+cu128`），不需要额外操作。
+
+确认一下装的是 CUDA 版：
 
 ```bash
-uv pip install torch --index-url https://download.pytorch.org/whl/cu128
+uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+# 期望输出类似：2.11.0+cu128 True
 ```
+
+如果想改成 CPU 版，把 `[tool.uv.sources]` 那两行删掉，再 `uv sync` 即可。
 
 ## 目录结构
 
@@ -131,6 +162,7 @@ pytorch-captcha-cnn/
 ├── evaluate.py         # 算整体准确率和每一位的准确率
 ├── plotting.py         # matplotlib 中文字体设置
 ├── fonts/              # 可选：自带的字体文件
+├── docs/               # README 用到的图片
 ├── samples/            # 生成的样本图（git 忽略）
 ├── figures/            # 训练曲线、预测样例（git 忽略）
 └── checkpoints/        # 模型权重和训练日志（git 忽略）
@@ -231,3 +263,7 @@ pytorch-captcha-cnn/
 
 - [ypwhs/captcha_break](https://github.com/ypwhs/captcha_break) — 原始 Keras 实现
 - PyTorch 官方文档：<https://pytorch.org/docs/stable/index.html>
+
+## License
+
+MIT
