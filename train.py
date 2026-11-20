@@ -180,6 +180,115 @@ def pick_device(name):
 
 
 # ----------------------------------------------------------------------
+# 资源监控：显存、GPU 利用率
+# ----------------------------------------------------------------------
+def describe_gpu(device):
+    """返回显卡信息描述（用于打印到日志）。"""
+    if device.type != "cuda":
+        return "CPU（无 GPU 加速）"
+    props = torch.cuda.get_device_properties(device)
+    return (
+        f"{props.name} | {props.total_memory / 1024 ** 3:.1f} GiB 显存 | "
+        f"SM 数 {props.multi_processor_count} | CUDA {torch.version.cuda}"
+    )
+
+
+def reset_vram_peak(device):
+    """把显存峰值计数器清零，准备统计下一轮的峰值。"""
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.synchronize(device)
+
+
+def current_vram_mb(device):
+    """当前已分配显存（MiB）。CPU 上返回 0。"""
+    if device.type != "cuda":
+        return 0.0
+    return torch.cuda.memory_allocated(device) / 1024 ** 2
+
+
+def peak_vram_mb(device):
+    """本轮峰值显存（MiB）。CPU 上返回 0。"""
+    if device.type != "cuda":
+        return 0.0
+    return torch.cuda.max_memory_allocated(device) / 1024 ** 2
+
+
+def gpu_utilization_pct(device):
+    """采样当前 GPU 利用率（%）。
+
+    用 nvidia-smi 采样。取不到就返回 None，不影响训练。
+    """
+    if device.type != "cuda":
+        return None
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu",
+                "--format=csv,noheader,nounits",
+                "-i",
+                str(device.index if device.index is not None else 0),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        value = result.stdout.strip().splitlines()[0].strip()
+        return float(value)
+    except Exception:
+        return None
+
+
+class GpuUtilSampler:
+    """在后台线程里持续采样 GPU 利用率，取一轮内的平均值。
+
+    为什么不用「epoch 结束后采样一次」：
+    那一刻训练已经停了，GPU 处于空闲状态，采样到的利用率接近 0，
+    完全反映不出训练时的真实负载。所以改成训练期间后台采样，
+    最后取平均 / 峰值。
+
+    非 CUDA 设备下这个类什么都不做，直接返回 None。
+    """
+
+    def __init__(self, device, interval=0.5):
+        self.device = device
+        self.interval = interval
+        self.samples = []
+        self._thread = None
+        self._stop_event = None
+
+    def _worker(self):
+        while not self._stop_event.is_set():
+            value = gpu_utilization_pct(self.device)
+            if value is not None:
+                self.samples.append(value)
+            self._stop_event.wait(self.interval)
+
+    def start(self):
+        if self.device.type != "cuda":
+            return self
+        import threading
+
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self):
+        """停止采样，返回 (平均值, 峰值)。"""
+        if self.device.type != "cuda" or self._thread is None:
+            return None, None
+        self._stop_event.set()
+        self._thread.join(timeout=2)
+        if not self.samples:
+            return None, None
+        return sum(self.samples) / len(self.samples), max(self.samples)
+
+
+# ----------------------------------------------------------------------
 # 训练与评估
 # ----------------------------------------------------------------------
 def compute_loss(outputs, labels, criterion):
@@ -258,34 +367,54 @@ def run_epoch(model, loader, device, criterion, optimizer=None, scheduler=None):
 # ----------------------------------------------------------------------
 # 日志与绘图
 # ----------------------------------------------------------------------
-def write_log(path, epoch, train_loss, val_loss, overall_acc, per_position_acc, lr):
+def write_log(path, epoch, train_loss, val_loss, overall_acc, per_position_acc, lr,
+              extra=None):
     """把一轮的训练结果追加到 CSV。
 
     第一次写会先写表头。
+    extra 是额外的列（耗时、显存占用等），用字典传进来。
+
+    注意：如果已存在的日志表头和这次列数不一致（老版本日志没有资源列），
+    就把老日志清掉重写，避免两种列数的行混在一起把图画坏。
     """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    is_new = not os.path.exists(path)
-    with open(path, "a", newline="", encoding="utf-8") as f:
+    extra = extra or {}
+    header = (
+        ["epoch", "lr", "train_loss", "val_loss", "overall_acc"]
+        + [f"acc_pos{i + 1}" for i in range(len(per_position_acc))]
+        + list(extra.keys())
+    )
+    row = (
+        [
+            epoch,
+            f"{lr:.6g}",
+            f"{train_loss:.6f}",
+            f"{val_loss:.6f}",
+            f"{overall_acc:.6f}",
+        ]
+        + [f"{a:.6f}" for a in per_position_acc]
+        + list(extra.values())
+    )
+
+    # 老日志的表头和现在不一致 → 说明列结构变了，直接重开一个干净日志
+    need_reset = False
+    if os.path.exists(path):
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            old_header = next(reader, None)
+        if old_header != header:
+            need_reset = True
+
+    mode = "w" if need_reset else "a"
+    with open(path, mode, newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        if is_new:
-            writer.writerow(
-                ["epoch", "lr", "train_loss", "val_loss", "overall_acc"]
-                + [f"acc_pos{i + 1}" for i in range(len(per_position_acc))]
-            )
-        writer.writerow(
-            [
-                epoch,
-                f"{lr:.6g}",
-                f"{train_loss:.6f}",
-                f"{val_loss:.6f}",
-                f"{overall_acc:.6f}",
-            ]
-            + [f"{a:.6f}" for a in per_position_acc]
-        )
+        if mode == "w":
+            writer.writerow(header)
+        writer.writerow(row)
 
 
 def plot_history(path, out_path):
-    """读 CSV 日志，画训练/验证损失和整体准确率曲线。"""
+    """读 CSV 日志，画训练/验证损失、整体准确率、学习率和资源占用曲线。"""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -296,6 +425,7 @@ def plot_history(path, out_path):
     setup_chinese_font()
 
     epochs, train_losses, val_losses, accs, lrs = [], [], [], [], []
+    epoch_times, vram_mb, gpu_util = [], [], []
     with open(path, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             epochs.append(int(row["epoch"]))
@@ -304,35 +434,87 @@ def plot_history(path, out_path):
             accs.append(float(row["overall_acc"]) * 100)
             # lr 列可能不存在（老日志），做个兜底
             lrs.append(float(row.get("lr") or 0))
+            # 资源占用列同样是可选的，老日志没有就跳过
+            t = row.get("epoch_time_s")
+            epoch_times.append(float(t) if t else None)
+            v = row.get("vram_mb")
+            vram_mb.append(float(v) if v else None)
+            u = row.get("gpu_util_pct")
+            gpu_util.append(float(u) if u else None)
 
-    fig, axes = plt.subplots(1, 3, figsize=(17, 4.5))
+    has_lr = any(lr > 0 for lr in lrs)
+    has_res = any(v is not None for v in vram_mb) or any(
+        t is not None for t in epoch_times
+    )
 
-    axes[0].plot(epochs, train_losses, label="train loss", color="#1f4e79")
-    axes[0].plot(epochs, val_losses, label="val loss", color="#c0392b")
-    axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("Loss")
-    axes[0].set_title("损失曲线")
-    axes[0].grid(True, alpha=0.3)
-    axes[0].legend()
+    # 有资源数据时画 2×2，没有时退回 1×3
+    if has_res:
+        fig, axes = plt.subplots(2, 2, figsize=(13, 8.5))
+        flat = list(axes.flatten())
+    else:
+        fig, axes = plt.subplots(1, 3, figsize=(17, 4.5))
+        flat = list(axes.flatten())
 
-    axes[1].plot(epochs, accs, label="整体准确率", color="#1e7f4f")
-    axes[1].set_xlabel("Epoch")
-    axes[1].set_ylabel("Accuracy (%)")
-    axes[1].set_title("验证集整体准确率（4 位全对）")
-    axes[1].grid(True, alpha=0.3)
-    axes[1].legend()
+    flat[0].plot(epochs, train_losses, label="train loss", color="#1f4e79")
+    flat[0].plot(epochs, val_losses, label="val loss", color="#c0392b")
+    flat[0].set_xlabel("Epoch")
+    flat[0].set_ylabel("Loss")
+    flat[0].set_title("损失曲线")
+    flat[0].grid(True, alpha=0.3)
+    flat[0].legend()
+
+    flat[1].plot(epochs, accs, label="整体准确率", color="#1e7f4f")
+    flat[1].set_xlabel("Epoch")
+    flat[1].set_ylabel("Accuracy (%)")
+    flat[1].set_title("验证集整体准确率（4 位全对）")
+    flat[1].grid(True, alpha=0.3)
+    flat[1].legend()
 
     # 学习率曲线：自动学习率和手动学习率的差别一眼就能看出来
-    if any(lr > 0 for lr in lrs):
-        axes[2].plot(epochs, lrs, label="学习率", color="#8e44ad")
-        axes[2].set_xlabel("Epoch")
-        axes[2].set_ylabel("Learning Rate")
-        axes[2].set_title("学习率变化")
-        axes[2].set_yscale("log")
-        axes[2].grid(True, alpha=0.3)
-        axes[2].legend()
+    if has_lr:
+        flat[2].plot(epochs, lrs, label="学习率", color="#8e44ad")
+        flat[2].set_xlabel("Epoch")
+        flat[2].set_ylabel("Learning Rate")
+        flat[2].set_title("学习率变化")
+        flat[2].set_yscale("log")
+        flat[2].grid(True, alpha=0.3)
+        flat[2].legend()
     else:
-        axes[2].axis("off")
+        flat[2].axis("off")
+
+    # 资源占用子图：每轮耗时、显存峰值、GPU 利用率
+    if has_res:
+        ax = flat[3]
+        # 耗时用左轴，显存用右轴，两条量级差别很大的曲线分开看
+        times = [(t if t is not None else float("nan")) for t in epoch_times]
+        ax.plot(epochs, times, label="每轮耗时 (s)", color="#e67e22", marker="o", ms=3)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("每轮耗时 (s)", color="#e67e22")
+        ax.tick_params(axis="y", labelcolor="#e67e22")
+        ax.grid(True, alpha=0.3)
+
+        ax2 = ax.twinx()
+        vram = [(v if v is not None else float("nan")) for v in vram_mb]
+        ax2.plot(epochs, vram, label="显存峰值 (MiB)", color="#2980b9", marker="s", ms=3)
+        ax2.set_ylabel("显存峰值 (MiB)", color="#2980b9")
+        ax2.tick_params(axis="y", labelcolor="#2980b9")
+
+        lines = ax.get_lines() + ax2.get_lines()
+        ax.legend(lines, [l.get_label() for l in lines], loc="upper left", fontsize=9)
+        ax.set_title("训练耗时与显存占用")
+
+        # 图例里再加上 GPU 利用率平均值（如果有记录）
+        util_values = [u for u in gpu_util if u is not None]
+        if util_values:
+            ax.text(
+                0.02,
+                0.95,
+                f"GPU 平均利用率：{sum(util_values) / len(util_values):.1f}%",
+                transform=ax.transAxes,
+                fontsize=9,
+                va="top",
+                color="#2c3e50",
+            )
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -440,6 +622,10 @@ def train_stage(
 
     for epoch in range(start_epoch, start_epoch + epochs):
         started = time.time()
+        # 清零显存峰值统计，准备记录这一轮的峰值占用
+        reset_vram_peak(device)
+        # 后台持续采样 GPU 利用率，等 epoch 结束再取平均
+        sampler = GpuUtilSampler(device).start()
         # auto_lr=False 时才是手动设置学习率；
         # auto_lr=True 时由 scheduler 自己控制，这里不碰。
         if not auto_lr:
@@ -469,7 +655,26 @@ def train_stage(
             if after != before:
                 print(f"    ↘ 自动调整学习率 {before:.2e} → {after:.2e}")
 
-        write_log(log_path, epoch + 1, train_loss, val_loss, val_acc, per_pos, cur_lr)
+        # 本轮资源占用：耗时、显存峰值、GPU 利用率
+        epoch_time = time.time() - started
+        vram_peak = peak_vram_mb(device)
+        util_avg, util_peak = sampler.stop()
+        extra = {
+            "epoch_time_s": f"{epoch_time:.2f}",
+            "vram_mb": f"{vram_peak:.1f}",
+            "gpu_util_pct": f"{util_avg:.1f}" if util_avg is not None else "",
+        }
+
+        write_log(
+            log_path,
+            epoch + 1,
+            train_loss,
+            val_loss,
+            val_acc,
+            per_pos,
+            cur_lr,
+            extra=extra,
+        )
 
         improved = val_acc > best_acc
         if improved:
@@ -487,11 +692,15 @@ def train_stage(
 
         pos_str = " ".join(f"{a * 100:5.1f}%" for a in per_pos)
         marker = " *最佳*" if improved else ""
+        if util_avg is not None:
+            util_str = f" | GPU 均 {util_avg:.0f}% 峰 {util_peak:.0f}%"
+        else:
+            util_str = ""
         print(
             f"[{tag}] epoch {epoch + 1:3d} | lr {cur_lr:.1e} | "
             f"train {train_loss:.4f} | val {val_loss:.4f} | "
             f"整体 {val_acc * 100:6.2f}% | 每位 {pos_str} | "
-            f"{time.time() - started:.1f}s{marker}"
+            f"{epoch_time:.1f}s | 显存峰值 {vram_peak:.0f}MiB{util_str}{marker}"
         )
 
         if wait >= patience:
@@ -516,8 +725,11 @@ def main():
     print(f"设备：{device}")
     if device.type == "cuda":
         print(f"显卡：{torch.cuda.get_device_name(0)}")
+    print(f"硬件信息：{describe_gpu(device)}")
     print(f"字符集：{DEFAULT_CHARACTERS}（{len(DEFAULT_CHARACTERS)} 类）")
     print(f"验证码长度：{args.n_len}    图像尺寸：{args.height}x{args.width}")
+    # 记录整场训练的开始时间，最后统计总耗时
+    training_started = time.time()
 
     # 数据
     train_loader, val_loader = make_dataloaders(
@@ -678,6 +890,19 @@ def main():
         print(f"已保存训练曲线：{history_path}")
     except Exception as exc:  # pragma: no cover - 画图失败不应该影响训练结果
         print(f"画图失败（不影响训练结果）：{exc}")
+
+    # 资源占用汇总
+    total_time = time.time() - training_started
+    print("-" * 70)
+    print("资源占用汇总：")
+    print(f"  总耗时：{total_time:.1f} 秒（{total_time / 60:.1f} 分钟）")
+    print(f"  显卡：{describe_gpu(device)}")
+    if device.type == "cuda":
+        print(f"  显存峰值：{peak_vram_mb(device):.0f} MiB")
+        print(
+            f"  显存已分配：{current_vram_mb(device):.0f} MiB / "
+            f"{torch.cuda.get_device_properties(device).total_memory / 1024 ** 3:.1f} GiB"
+        )
 
     print(f"模型权重：{args.checkpoint}")
     print(f"训练日志：{args.log}")

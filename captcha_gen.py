@@ -99,6 +99,7 @@ class CaptchaGenerator:
         n_len=4,
         font_paths=None,
         font_size=None,
+        clear=True,
     ):
         """初始化生成器的参数。
 
@@ -107,6 +108,7 @@ class CaptchaGenerator:
         n_len: 验证码长度
         font_paths: 字体文件路径列表，依次尝试；None 表示自动查找
         font_size: 字号，None 表示按图像高度自动推算
+        clear: True 表示实验用的清晰模式；False 保留较强干扰效果
         """
         self.characters = characters if characters else DEFAULT_CHARACTERS
         self.width = width
@@ -115,6 +117,7 @@ class CaptchaGenerator:
         self.font_size = font_size if font_size else max(24, int(height * 0.6))
         self._font_paths = font_paths
         self._font_cache = {}
+        self.clear = clear
 
     # ------------------------------------------------------------------
     # 字体
@@ -190,40 +193,52 @@ class CaptchaGenerator:
         )
 
     def _draw_lines(self, draw):
-        """画 2~4 条随机干扰线。
+        """画随机干扰线。
 
-        线的颜色比背景深一点，但不至于完全盖住文字
-        （完全盖住的话模型就真的认不出来了）。
+        干扰线始终画在文字下方，不覆盖字符笔画。清晰模式只调整线条
+        深浅，噪声数量不因此减少。
         """
-        for _ in range(random.randint(2, 4)):
+        count = random.randint(2, 4)
+        for _ in range(count):
             x1 = random.randint(0, self.width)
             y1 = random.randint(0, self.height)
             x2 = random.randint(0, self.width)
             y2 = random.randint(0, self.height)
-            color = (
-                random.randint(80, 170),
-                random.randint(80, 170),
-                random.randint(80, 170),
-                255,
-            )
-            draw.line([(x1, y1), (x2, y2)], fill=color, width=random.randint(1, 3))
+            if self.clear:
+                level = random.randint(150, 215)
+                width = random.randint(1, 2)
+            else:
+                level = random.randint(80, 170)
+                width = random.randint(1, 3)
+            color = (level, level, level, 255)
+            draw.line([(x1, y1), (x2, y2)], fill=color, width=width)
 
     def _draw_noise(self, image):
         """随机撒一些噪点像素。
 
-        噪点数量很少，主要是为了增加一点难度，同时不至于影响可读性。
+        噪点保留原实验的随机数量。清晰模式只避免纯黑或纯白的高对比
+        噪点，防止它们看起来像字符笔画；字符本身仍由独立的高分辨率
+        轮廓层绘制，不会被这些背景噪点弄模糊。
         """
-        n_noise = random.randint(20, 60)
+        n_noise = random.randint(80, 160) if self.clear else random.randint(20, 60)
         pixels = image.load()
         for _ in range(n_noise):
             x = random.randint(0, self.width - 1)
             y = random.randint(0, self.height - 1)
-            pixels[x, y] = (
-                random.randint(0, 255),
-                random.randint(0, 255),
-                random.randint(0, 255),
-                255,
-            )
+            if self.clear:
+                # 噪声以浅灰为主，少数稍深一点，避免破坏字符轮廓。
+                if random.random() < 0.15:
+                    level = random.randint(120, 175)
+                else:
+                    level = random.randint(175, 235)
+                pixels[x, y] = (level, level, level, 255)
+            else:
+                pixels[x, y] = (
+                    random.randint(0, 255),
+                    random.randint(0, 255),
+                    random.randint(0, 255),
+                    255,
+                )
 
     def _draw_text(self, canvas, text):
         """把每个字符画到画布上。
@@ -248,16 +263,28 @@ class CaptchaGenerator:
         # 每个字符占据的横向宽度
         slot = self.width / max(n, 1)
 
-        # 字号自适应：不能超过格子的宽度，否则旋转后会溢出格子。
-        # 旋转会让字符变宽（约 1.3 倍），所以这里留出余量。
-        font = self._fit_font(slot * 0.78, self.height * 0.8)
+        # 字号自适应：根据字符实际边界框和旋转后的外接矩形留出安全空间。
+        # 不能只按格子宽度估算，否则字体自身的 ascent/descent 或某些字形
+        # （例如带下伸部的字母）仍可能被裁掉。
+        font = self._fit_font(slot * 0.78, self.height * 0.72)
 
         # 第一步：先把所有字符渲染出来（带旋转），量出总宽度
         rendered = []
+        # 清晰模式下只减少旋转和错位，让字符轮廓保持明确；仍保留一定变化，
+        # 避免训练集完全固定。
+        angle_limit = 18 if self.clear else 20
+        y_jitter = self.height // 16 if self.clear else self.height // 12
         for ch in text:
             char_img = self._render_char(ch, font)
-            angle = random.uniform(-20, 20)
-            rotated = char_img.rotate(angle, expand=True, resample=Image.BILINEAR)
+            angle = random.uniform(-angle_limit, angle_limit)
+            # 直接旋转原始字形。不要在旋转前裁掉透明边距，也不要先缩放
+            # 再旋转，否则细笔画容易被重采样削薄或截断。
+            rotated = char_img.rotate(
+                angle,
+                expand=True,
+                resample=Image.BICUBIC if self.clear else Image.BILINEAR,
+                fillcolor=(0, 0, 0, 0),
+            )
             rendered.append(rotated)
 
         total_w = sum(img.width for img in rendered)
@@ -266,7 +293,7 @@ class CaptchaGenerator:
         # 字符之间的间隙：只算 n-1 个（字符与字符之间），
         # 不能算 n 个，否则最后一个字符会被推出画布右边。
         # 同时左右各留一点边距（margin），避免字符贴边被裁。
-        margin = 2
+        margin = 4
         avail = max(1, self.width - margin * 2)
 
         # 保险：如果总宽还是超了画布（比如碰巧全是宽字符 W/M/Q），
@@ -278,7 +305,9 @@ class CaptchaGenerator:
             for img in rendered:
                 new_w = max(1, int(img.width * scale))
                 new_h = max(1, int(img.height * scale))
-                resized.append(img.resize((new_w, new_h), Image.LANCZOS))
+                # 用超采样重绘后再缩放，避免直接缩放旋转图导致笔画变细。
+                resample = Image.LANCZOS if self.clear else Image.BILINEAR
+                resized.append(img.resize((new_w, new_h), resample))
             rendered = resized
             total_w = sum(img.width for img in rendered)
             total_h = max(img.height for img in rendered) if rendered else 0
@@ -294,12 +323,12 @@ class CaptchaGenerator:
         # 依次摆上去
         x = start_x
         for i, rotated in enumerate(rendered):
-            # 随机纵向错位
-            dy = random.randint(-self.height // 12, self.height // 12)
+            # 随机纵向错位，但错位后必须仍能完整放在画布中。
+            dy = random.randint(-y_jitter, y_jitter)
             px = x
             py = base_y + dy
 
-            # 纵向不许越界
+            # 纵向不许越界：这里既限制起点，也保证字符图完整可见。
             py = max(0, min(py, self.height - rotated.height))
             # 横向也不许越界（万一总宽算多了，硬拉回来）
             px = max(0, min(px, self.width - rotated.width))
@@ -364,29 +393,41 @@ class CaptchaGenerator:
 
         返回 RGBA 的 PIL.Image。
         """
-        # 先用足够大的画布量一下文字实际占多大
-        tmp = Image.new("RGBA", (self.font_size * 3, self.font_size * 3), (0, 0, 0, 0))
+        # 先用足够大的画布量一下文字实际占多大。
+        # 不在字符自身大小上直接绘制，避免字体某些字形的边界恰好被裁掉。
+        measure_size = max(self.font_size * 4, 128)
+        tmp = Image.new("RGBA", (measure_size, measure_size), (0, 0, 0, 0))
         tmp_draw = ImageDraw.Draw(tmp)
-        tmp_draw.text((10, 10), ch, font=font, fill=(0, 0, 0, 255))
+        tmp_draw.text((measure_size // 4, measure_size // 4), ch, font=font, fill=(0, 0, 0, 255))
 
         bbox = tmp.getbbox()
         if bbox is None:
             # 空白字符（比如空格），退化成一个小方块
             bbox = (0, 0, self.font_size, self.font_size)
 
-        # 裁掉四周的透明区域
-        tight = tmp.crop(bbox)
+        # 给字形四周增加透明边距。Pillow 的 text() 使用字体自身的
+        # ascent/descent 定位，部分字体字形可能贴到临时画布边缘；
+        # 保留边距可以避免字符上、下或左、右被截断。
+        padding = max(3, self.font_size // 6)
+        left = max(0, bbox[0] - padding)
+        top = max(0, bbox[1] - padding)
+        right = min(tmp.width, bbox[2] + padding)
+        bottom = min(tmp.height, bbox[3] + padding)
+        bbox = (left, top, right, bottom)
 
-        # 重新画一遍到精确大小的图上，填上随机颜色
-        canvas = Image.new("RGBA", tight.size, (0, 0, 0, 0))
+        # 裁掉四周多余的透明区域，但保留安全边距。
+        # 重新绘制时使用同一张完整测量画布，避免二次绘制坐标不一致导致
+        # 字形被裁掉。
+        canvas = Image.new("RGBA", (measure_size, measure_size), (0, 0, 0, 0))
         canvas_draw = ImageDraw.Draw(canvas)
         color = (
-            random.randint(0, 120),
-            random.randint(0, 120),
-            random.randint(0, 120),
+            random.randint(0, 80),
+            random.randint(0, 80),
+            random.randint(0, 80),
         )
-        canvas_draw.text((0, 0), ch, font=font, fill=color + (255,))
-        return canvas
+        canvas_draw.text((measure_size // 4, measure_size // 4), ch, font=font, fill=color + (255,))
+        # 只裁掉测量得到的安全区域，保留边距。
+        return canvas.crop(bbox)
 
     # ------------------------------------------------------------------
     # 批量

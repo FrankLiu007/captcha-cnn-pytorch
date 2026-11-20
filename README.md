@@ -24,6 +24,15 @@
 <img src="docs/captcha_samples.png" width="640" alt="验证码样例">
 </div>
 
+### 训练曲线
+
+<div align="center">
+<img src="docs/training_curves.png" width="720" alt="训练曲线">
+</div>
+
+训练日志里记录了每一轮的**耗时、显存峰值和 GPU 利用率**，
+曲线图右下角就是这三项的变化，可以直观看出瓶颈在哪。
+
 ## 这个项目做了什么
 
 - **验证码生成器从零手写** —— 纯 Pillow + numpy，不依赖第三方 `captcha` 库
@@ -160,6 +169,7 @@ pytorch-captcha-cnn/
 ├── train.py            # 训练脚本
 ├── predict.py          # 识别并画对比图
 ├── evaluate.py         # 算整体准确率和每一位的准确率
+├── make_samples.py     # 生成验证码样例图（README 用）
 ├── plotting.py         # matplotlib 中文字体设置
 ├── fonts/              # 可选：自带的字体文件
 ├── docs/               # README 用到的图片
